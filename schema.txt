@@ -1,0 +1,235 @@
+-- NelsonGPT Database Schema
+-- This file creates the necessary tables for the pediatric medical assistant
+
+-- Enable pgvector extension for embeddings
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Nelson Textbook of Pediatrics content table
+CREATE TABLE IF NOT EXISTS nelson_book_of_pediatrics (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    chapter TEXT NOT NULL,
+    page INTEGER,
+    section TEXT,
+    subsection TEXT,
+    tags TEXT[] DEFAULT '{}',
+    embedding vector(384), -- HuggingFace sentence-transformers/all-MiniLM-L6-v2 dimensions
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Additional pediatric medical resources table
+CREATE TABLE IF NOT EXISTS pediatric_medical_resource (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    resource_type TEXT NOT NULL CHECK (resource_type IN ('drug_dosing', 'emergency_protocol', 'growth_chart', 'vaccine_schedule', 'clinical_guideline')),
+    age_group TEXT CHECK (age_group IN ('neonate', 'infant', 'toddler', 'preschool', 'school_age', 'adolescent', 'all')),
+    urgency_level TEXT CHECK (urgency_level IN ('low', 'medium', 'high', 'emergency')),
+    source TEXT,
+    evidence_level TEXT CHECK (evidence_level IN ('A', 'B', 'C', 'D', 'expert_opinion')),
+    tags TEXT[] DEFAULT '{}',
+    embedding vector(384),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Drug dosage information table
+CREATE TABLE IF NOT EXISTS pediatric_drug_dosages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    drug_name TEXT NOT NULL,
+    generic_name TEXT,
+    indication TEXT NOT NULL,
+    route TEXT NOT NULL CHECK (route IN ('oral', 'iv', 'im', 'topical', 'inhaled', 'rectal', 'sublingual')),
+    dose_per_kg DECIMAL(10,4),
+    dose_per_m2 DECIMAL(10,4),
+    max_dose DECIMAL(10,2),
+    min_age_months INTEGER,
+    max_age_months INTEGER,
+    frequency TEXT NOT NULL,
+    duration TEXT,
+    contraindications TEXT[],
+    side_effects TEXT[],
+    monitoring_parameters TEXT[],
+    notes TEXT,
+    source TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Emergency protocols table
+CREATE TABLE IF NOT EXISTS emergency_protocols (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN ('resuscitation', 'trauma', 'poisoning', 'respiratory', 'cardiac', 'neurological', 'anaphylaxis')),
+    age_group TEXT CHECK (age_group IN ('neonate', 'infant', 'child', 'adolescent', 'all')),
+    steps JSONB NOT NULL, -- Array of protocol steps with order, action, timing
+    contraindications TEXT[],
+    equipment_needed TEXT[],
+    drug_dosages JSONB, -- Reference to specific drug dosages for emergency
+    source TEXT,
+    last_reviewed TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Growth charts and developmental milestones
+CREATE TABLE IF NOT EXISTS growth_development (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type TEXT NOT NULL CHECK (type IN ('growth_chart', 'developmental_milestone', 'screening_tool')),
+    title TEXT NOT NULL,
+    age_range_min_months INTEGER NOT NULL,
+    age_range_max_months INTEGER NOT NULL,
+    gender TEXT CHECK (gender IN ('male', 'female', 'both')),
+    percentile_data JSONB, -- For growth charts
+    milestone_data JSONB, -- For developmental milestones
+    reference_ranges JSONB, -- Normal ranges
+    source TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Chat history table (for storing user conversations)
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID, -- Future user management
+    title TEXT NOT NULL,
+    messages JSONB NOT NULL, -- Array of message objects
+    medical_context JSONB, -- Patient context if provided
+    urgency_level TEXT CHECK (urgency_level IN ('low', 'medium', 'high', 'emergency')),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_nelson_embedding ON nelson_book_of_pediatrics USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_medical_resource_embedding ON pediatric_medical_resource USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_nelson_chapter ON nelson_book_of_pediatrics(chapter);
+CREATE INDEX IF NOT EXISTS idx_nelson_tags ON nelson_book_of_pediatrics USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_medical_resource_type ON pediatric_medical_resource(resource_type);
+CREATE INDEX IF NOT EXISTS idx_medical_resource_age ON pediatric_medical_resource(age_group);
+CREATE INDEX IF NOT EXISTS idx_drug_name ON pediatric_drug_dosages(drug_name);
+CREATE INDEX IF NOT EXISTS idx_drug_indication ON pediatric_drug_dosages(indication);
+CREATE INDEX IF NOT EXISTS idx_emergency_category ON emergency_protocols(category);
+CREATE INDEX IF NOT EXISTS idx_growth_type ON growth_development(type);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_created ON chat_sessions(created_at);
+
+-- RPC function for semantic search
+CREATE OR REPLACE FUNCTION search_medical_content(
+    query_embedding vector(384),
+    match_count int DEFAULT 5,
+    similarity_threshold float DEFAULT 0.7
+)
+RETURNS TABLE (
+    id uuid,
+    title text,
+    content text,
+    chapter text,
+    page integer,
+    tags text[],
+    similarity float,
+    updated_at timestamptz
+)
+LANGUAGE sql
+AS $$
+    SELECT 
+        n.id,
+        n.title,
+        n.content,
+        n.chapter,
+        n.page,
+        n.tags,
+        1 - (n.embedding <=> query_embedding) as similarity,
+        n.updated_at
+    FROM nelson_book_of_pediatrics n
+    WHERE 1 - (n.embedding <=> query_embedding) > similarity_threshold
+    ORDER BY n.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- RPC function for drug dosage search
+CREATE OR REPLACE FUNCTION search_drug_dosages(
+    drug_search text,
+    indication_search text DEFAULT NULL,
+    age_months integer DEFAULT NULL
+)
+RETURNS TABLE (
+    id uuid,
+    drug_name text,
+    indication text,
+    route text,
+    dose_per_kg decimal,
+    max_dose decimal,
+    frequency text,
+    contraindications text[],
+    notes text
+)
+LANGUAGE sql
+AS $$
+    SELECT 
+        d.id,
+        d.drug_name,
+        d.indication,
+        d.route,
+        d.dose_per_kg,
+        d.max_dose,
+        d.frequency,
+        d.contraindications,
+        d.notes
+    FROM pediatric_drug_dosages d
+    WHERE 
+        (drug_search IS NULL OR d.drug_name ILIKE '%' || drug_search || '%')
+        AND (indication_search IS NULL OR d.indication ILIKE '%' || indication_search || '%')
+        AND (age_months IS NULL OR (d.min_age_months IS NULL OR age_months >= d.min_age_months))
+        AND (age_months IS NULL OR (d.max_age_months IS NULL OR age_months <= d.max_age_months))
+    ORDER BY d.drug_name, d.indication;
+$$;
+
+-- Sample data insertion for Nelson Textbook content
+INSERT INTO nelson_book_of_pediatrics (title, content, chapter, page, section, tags) VALUES
+('Acute Otitis Media Treatment', 'Acute otitis media is one of the most common infections in children. First-line treatment typically includes amoxicillin 80-90 mg/kg/day divided into 2-3 doses for 10 days in children under 2 years, or 5-7 days in children over 2 years. For penicillin-allergic patients, alternatives include azithromycin, clarithromycin, or cefdinir.', 'Infectious Diseases', 1234, 'Ear Infections', ARRAY['otitis media', 'ear infection', 'amoxicillin', 'antibiotics']),
+
+('Neonatal Resuscitation Protocol', 'The initial steps of neonatal resuscitation include: 1) Provide warmth, 2) Clear airway, 3) Dry and stimulate, 4) Evaluate heart rate and breathing. If heart rate <100 bpm, begin positive pressure ventilation. If heart rate <60 bpm after 30 seconds of PPV, begin chest compressions at 3:1 ratio.', 'Neonatology', 567, 'Delivery Room Management', ARRAY['resuscitation', 'newborn', 'emergency', 'delivery']),
+
+('Pediatric Asthma Management', 'Asthma management in children follows a stepwise approach. Step 1: SABA PRN. Step 2: Low-dose ICS + SABA PRN. Step 3: Medium-dose ICS or low-dose ICS + LABA. Acute exacerbations require immediate bronchodilator therapy with albuterol 2.5-5mg via nebulizer every 20 minutes for 3 doses, followed by systemic corticosteroids if needed.', 'Pulmonology', 890, 'Chronic Respiratory Conditions', ARRAY['asthma', 'bronchodilator', 'albuterol', 'inhaled corticosteroids']),
+
+('Growth Chart Interpretation', 'Growth charts are essential tools for monitoring child development. Plot height, weight, and head circumference at each visit. Children should generally stay within 2 percentile lines of their established growth pattern. Crossing 2 or more percentile lines may indicate underlying pathology and warrants further evaluation.', 'Growth and Development', 123, 'Growth Assessment', ARRAY['growth charts', 'percentiles', 'development', 'monitoring']);
+
+-- Sample drug dosage data
+INSERT INTO pediatric_drug_dosages (drug_name, generic_name, indication, route, dose_per_kg, max_dose, min_age_months, frequency, contraindications, notes) VALUES
+('Amoxicillin', 'amoxicillin', 'Acute otitis media', 'oral', 80.0, 3000.0, 0, 'twice daily', ARRAY['penicillin allergy'], 'First-line therapy for uncomplicated AOM'),
+('Albuterol', 'salbutamol', 'Acute asthma exacerbation', 'inhaled', NULL, 5.0, 0, 'every 20 minutes x3, then PRN', ARRAY['hypersensitivity'], 'Nebulizer dose: 2.5-5mg per dose'),
+('Acetaminophen', 'paracetamol', 'Fever/pain', 'oral', 15.0, 1000.0, 0, 'every 4-6 hours', ARRAY['liver disease'], 'Maximum 5 doses per day'),
+('Ibuprofen', 'ibuprofen', 'Fever/pain', 'oral', 10.0, 800.0, 6, 'every 6-8 hours', ARRAY['renal disease', 'bleeding disorders'], 'Avoid in children <6 months');
+
+-- Sample emergency protocol
+INSERT INTO emergency_protocols (title, category, age_group, steps, contraindications, equipment_needed) VALUES
+('Pediatric Basic Life Support', 'resuscitation', 'child', 
+'[
+    {"order": 1, "action": "Check responsiveness and breathing", "timing": "immediate"},
+    {"order": 2, "action": "Call for help/activate emergency system", "timing": "immediate"},
+    {"order": 3, "action": "Position airway (head tilt-chin lift)", "timing": "immediate"},
+    {"order": 4, "action": "Give 2 rescue breaths", "timing": "1-2 seconds each"},
+    {"order": 5, "action": "Check pulse (carotid)", "timing": "5-10 seconds"},
+    {"order": 6, "action": "Begin chest compressions 30:2 ratio", "timing": "continuous"}
+]'::jsonb,
+ARRAY['obvious signs of life'],
+ARRAY['AED if available', 'bag-mask ventilation device']);
+
+-- Trigger to update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Apply trigger to all tables
+CREATE TRIGGER update_nelson_updated_at BEFORE UPDATE ON nelson_book_of_pediatrics FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_medical_resource_updated_at BEFORE UPDATE ON pediatric_medical_resource FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_drug_dosages_updated_at BEFORE UPDATE ON pediatric_drug_dosages FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_emergency_protocols_updated_at BEFORE UPDATE ON emergency_protocols FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_growth_development_updated_at BEFORE UPDATE ON growth_development FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_chat_sessions_updated_at BEFORE UPDATE ON chat_sessions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
